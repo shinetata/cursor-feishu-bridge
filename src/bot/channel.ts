@@ -89,6 +89,7 @@ export class Channel {
         switch (event.type) {
           case 'text':
             state.text += event.delta;
+            log.info('channel', 'text-delta', { chatId, len: state.text.length });
             await patch();
             break;
 

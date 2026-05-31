@@ -60,20 +60,42 @@ export class BotHandler {
 
   private async onMessage(msg: NormalizedMessage): Promise<void> {
     const chatId = msg.chatId;
-    const msgType = msg.messageType;
 
-    log.info('handler', 'receive', { chatId, msgType, messageId: msg.messageId });
+    log.info('handler', 'receive', {
+      chatId,
+      messageId: msg.messageId,
+      rawContentType: msg.rawContentType,
+      contentPreview: msg.content?.slice(0, 120),
+    });
 
     let prompt: string | null = null;
 
-    if (msgType === 'text') {
-      // NormalizedMessage.text contains the plain text, with @mentions stripped.
-      prompt = (msg.text ?? '').trim();
-    } else if (msgType === 'image' || msgType === 'file') {
-      prompt = `[用户发送了一个 ${msgType === 'image' ? '图片' : '文件'}，本地路径稍后实现]`;
+    // NormalizedMessage.content is a JSON string from the Feishu API.
+    // e.g. for text: '{"text":"hello"}', for post: '{"zh_cn":{"title":"...","content":[...]}}'
+    try {
+      const parsed = JSON.parse(msg.content) as Record<string, unknown>;
+      if (typeof parsed.text === 'string' && parsed.text.trim()) {
+        prompt = parsed.text.trim();
+      } else if (parsed.zh_cn || parsed.en_us) {
+        // Rich text (post) — extract title and first paragraph text
+        const block = (parsed.zh_cn ?? parsed.en_us) as { title?: string; content?: unknown[] };
+        prompt = block.title ? `[富文本] ${block.title}` : '[富文本消息]';
+      }
+    } catch {
+      // Non-JSON content — use as-is
+      if (msg.content?.trim()) prompt = msg.content.trim();
     }
 
-    if (!prompt) return;
+    // Fall back to resources (image / file / audio / video)
+    if (!prompt && msg.resources?.length) {
+      const types = msg.resources.map(r => r.type).join(', ');
+      prompt = `[用户发送了 ${types}，当前版本暂不支持处理附件]`;
+    }
+
+    if (!prompt) {
+      log.info('handler', 'skip-empty', { chatId, rawContentType: msg.rawContentType });
+      return;
+    }
 
     const channel = this.getChannel(chatId);
 

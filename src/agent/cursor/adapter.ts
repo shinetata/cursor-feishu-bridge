@@ -82,6 +82,7 @@ async function* createEventStream(opts: {
       log.info('cursor-sdk', 'resume', { agentId, cwd });
       agent = await Agent.resume(agentId, {
         apiKey,
+        model: { id: model },
         local: { cwd },
       });
     } else {

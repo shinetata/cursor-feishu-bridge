@@ -23,66 +23,63 @@ export interface RunCardState {
 }
 
 function buildCardJson(state: RunCardState, cwd: string): string {
+  const statusEmoji =
+    state.status === 'running' ? '🔵' :
+    state.status === 'done'    ? '✅' :
+    state.status === 'error'   ? '❌' : '⏹';
+
   const statusLabel =
     state.status === 'running' ? '生成中...' :
     state.status === 'done'    ? '已完成' :
     state.status === 'error'   ? '出错'   : '已停止';
 
-  const statusColor =
-    state.status === 'running' ? 'blue' :
-    state.status === 'done'    ? 'green' :
-    state.status === 'error'   ? 'red'   : 'grey';
-
   const cwdShort = cwd.replace(process.env['HOME'] ?? '', '~');
 
+  // In CardKit 2.0, the `action` wrapper tag is deprecated.
+  // Buttons must be placed directly inside body.elements.
   const elements: object[] = [
     {
-      tag: 'column_set',
-      flex_mode: 'stretch',
-      columns: [
-        {
-          tag: 'column',
-          elements: [{ tag: 'badge', text: { tag: 'plain_text', content: statusLabel }, color: statusColor }],
-        },
-        {
-          tag: 'column',
-          align: 'right',
-          elements: [{ tag: 'plain_text', content: cwdShort }],
-        },
-      ],
+      tag: 'markdown',
+      content: `${statusEmoji} **${statusLabel}** · \`${cwdShort}\``,
     },
     { tag: 'hr' },
     { tag: 'markdown', content: state.text || '_等待响应..._' },
   ];
 
   if (state.tools.length > 0) {
+    elements.push(
+      { tag: 'hr' },
+      {
+        tag: 'markdown',
+        content: `**工具调用 (${state.tools.length})**\n${state.tools.map((t) => `- \`${t}\``).join('\n')}`,
+      },
+    );
+  }
+
+  if (state.inputTokens > 0 || state.outputTokens > 0) {
     elements.push({
-      tag: 'collapsible_panel',
-      expanded: false,
-      header: { elements: [{ tag: 'plain_text', content: `工具调用 (${state.tools.length})` }] },
-      elements: state.tools.map((t) => ({ tag: 'markdown', content: `\`${t}\`` })),
+      tag: 'markdown',
+      content: `_${state.inputTokens}↑ ${state.outputTokens}↓ tokens_`,
     });
   }
 
-  const footerEls: object[] = [];
   if (state.status === 'running') {
-    footerEls.push({
+    elements.push({ tag: 'hr' });
+    elements.push({
       tag: 'button',
+      element_id: 'stop_btn',
       text: { tag: 'plain_text', content: '⏹ 停止' },
       type: 'danger',
-      behaviors: [{ type: 'callback', value: { __cursor_cb: true, action: 'stop' } }],
+      behaviors: [{ type: 'callback', value: { action: 'stop' } }],
     });
-  }
-  if (state.inputTokens > 0 || state.outputTokens > 0) {
-    footerEls.push({ tag: 'plain_text', content: `${state.inputTokens}↑ ${state.outputTokens}↓ tokens` });
-  }
-  if (footerEls.length > 0) {
-    elements.push({ tag: 'hr' }, { tag: 'action', elements: footerEls });
   }
 
   const card = {
     schema: '2.0',
-    config: { summary: { content: state.text.slice(0, 100) || statusLabel } },
+    config: {
+      streaming_mode: state.status === 'running',
+      summary: { content: state.text.slice(0, 100) || statusLabel },
+    },
     body: { elements },
   };
   return JSON.stringify(card);
@@ -116,6 +113,7 @@ export class CardRenderer {
         path: { message_id: messageId },
         data: { content },
       });
+      log.info('card', 'patched', { messageId, status: state.status, textLen: state.text.length });
     } catch (err) {
       log.warn('card', 'patch-failed', { messageId, err: String(err) });
     }
