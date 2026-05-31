@@ -1,0 +1,31 @@
+{
+  "name": "cursor-feishu-bridge",
+  "version": "0.1.0",
+  "description": "Bridge Feishu/Lark with Cursor Agent — 2-minute setup, streaming cards, per-chat sessions",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "cursor-feishu-bridge": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/cli.js run"
+  },
+  "dependencies": {
+    "@cursor/sdk": "latest",
+    "@larksuiteoapi/node-sdk": "^1.37.0",
+    "commander": "^12.0.0",
+    "open": "^10.0.0",
+    "qrcode-terminal": "^0.12.0",
+    "zod": "^3.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode-terminal": "^0.12.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.4.0"
+  }
+}
