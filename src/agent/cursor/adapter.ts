@@ -1,6 +1,7 @@
 import { Agent, CursorAgentError } from '@cursor/sdk';
 import type { AgentAdapter, AgentEvent, AgentRun, AgentRunOptions } from '../types.js';
 import { log } from '../../core/logger.js';
+import { ensureRipgrep } from './ripgrep.js';
 
 /**
  * Cursor SDK adapter.
@@ -73,6 +74,8 @@ async function* createEventStream(opts: {
 }): AsyncGenerator<AgentEvent> {
   const { prompt, cwd, agentId, apiKey, model, onStop } = opts;
 
+  ensureRipgrep();
+
   let agent: Awaited<ReturnType<typeof Agent.create>> | null = null;
   let stopped = false;
 
@@ -112,27 +115,43 @@ async function* createEventStream(opts: {
     log.info('cursor-sdk', 'run-started', { runId: run.id, agentId: agent.agentId });
 
     // Stream SDK events → normalized AgentEvent.
+    //
+    // Real @cursor/sdk message shapes (see node_modules/@cursor/sdk .../messages.d.ts):
+    //   - assistant  → message.content: (TextBlock | ToolUseBlock)[]  (text deltas)
+    //   - thinking   → top-level { text }  (reasoning deltas)
+    //   - tool_call  → top-level { name, status, args, result }, emitted twice:
+    //                  status 'running' (args) then 'completed' | 'error' (result)
+    // Tool rendering is driven by `tool_call` (richer: status + result); the
+    // ToolUseBlock inside assistant content is intentionally ignored to avoid
+    // double-rendering the same call.
     for await (const msg of run.stream()) {
       if (stopped) break;
 
-      if (msg.type === 'assistant') {
-        for (const block of msg.message.content) {
-          if (block.type === 'text') {
-            yield { type: 'text', delta: block.text };
-          } else if (block.type === 'thinking') {
-            yield { type: 'thinking', delta: block.thinking };
-          } else if (block.type === 'tool_use') {
-            yield { type: 'tool_use', name: block.name, input: block.input };
+      switch (msg.type) {
+        case 'assistant':
+          for (const block of msg.message.content) {
+            if (block.type === 'text') {
+              yield { type: 'text', delta: block.text };
+            }
           }
-        }
-      }
+          break;
 
-      if (msg.type === 'tool') {
-        const content = msg.result.content;
-        const text = Array.isArray(content)
-          ? content.filter((c) => c.type === 'text').map((c) => (c as { text: string }).text).join('\n')
-          : String(content);
-        yield { type: 'tool_result', output: text, isError: msg.result.is_error ?? false };
+        case 'thinking':
+          if (msg.text) yield { type: 'thinking', delta: msg.text };
+          break;
+
+        case 'tool_call':
+          if (msg.status === 'running') {
+            yield { type: 'tool_use', name: msg.name, input: msg.args };
+          } else if (msg.status === 'completed') {
+            yield { type: 'tool_result', output: resultToText(msg.result), isError: false };
+          } else if (msg.status === 'error') {
+            yield { type: 'tool_result', output: resultToText(msg.result), isError: true };
+          }
+          break;
+
+        default:
+          break;
       }
     }
 
@@ -162,5 +181,26 @@ async function* createEventStream(opts: {
         // ignore disposal errors
       }
     }
+  }
+}
+
+/** Flatten a tool_call result (string | { content: [...] } | object) to text. */
+function resultToText(result: unknown): string {
+  if (result == null) return '';
+  if (typeof result === 'string') return result;
+  try {
+    const r = result as { content?: unknown; text?: unknown };
+    if (Array.isArray(r.content)) {
+      return r.content
+        .filter((c): c is { type: string; text: string } =>
+          !!c && typeof c === 'object' && (c as { type?: string }).type === 'text' &&
+          typeof (c as { text?: unknown }).text === 'string')
+        .map((c) => c.text)
+        .join('\n');
+    }
+    if (typeof r.text === 'string') return r.text;
+    return JSON.stringify(result);
+  } catch {
+    return String(result);
   }
 }

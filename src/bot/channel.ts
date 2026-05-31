@@ -1,38 +1,31 @@
 /**
  * Channel — one per Feishu chat.
  *
- * Manages the full lifecycle of a single user message:
- *   receive → throttle/preempt → create/resume Agent → stream card → done
+ * Lifecycle of a single user message:
+ *   receive → (preempt prior run) → create/resume Cursor Agent →
+ *   stream a live markdown transcript (思考 / 工具 / 回答) → persist agentId
  *
- * Preemption: if a new message arrives while a run is in progress,
- * the running run is cancelled and a new one starts with the merged prompt.
+ * Rendering uses the SDK's `LarkChannel.stream({ markdown })`, which drives
+ * the native `cardkit.cardElement.content` typewriter API — smooth, throttled,
+ * serialized, and auto-rolls over when a card hits Feishu's element size cap.
+ * The TranscriptComposer turns each agent event into an append-only delta.
  */
+import type { LarkChannel } from '@larksuiteoapi/node-sdk';
 import type { AgentAdapter, AgentRun } from '../agent/types.js';
-import { CardRenderer, type RunCardState } from '../card/renderer.js';
-import {
-  getSession,
-  getSessionCwd,
-  setSession,
-  updateAgentId,
-} from '../session/manager.js';
+import { TranscriptComposer } from '../card/transcript.js';
+import { getSession, getSessionCwd, setSession, updateAgentId } from '../session/manager.js';
 import { log } from '../core/logger.js';
 
-const CARD_PATCH_INTERVAL_MS = 400;
-
 export class Channel {
-  private chatId: string;
-  private adapter: AgentAdapter;
-  private card: CardRenderer;
-
   private currentRun: AgentRun | null = null;
   private pendingPrompt: string | null = null;
   private processing = false;
 
-  constructor(chatId: string, adapter: AgentAdapter, card: CardRenderer) {
-    this.chatId = chatId;
-    this.adapter = adapter;
-    this.card = card;
-  }
+  constructor(
+    private readonly chatId: string,
+    private readonly adapter: AgentAdapter,
+    private readonly lark: LarkChannel,
+  ) {}
 
   /** Enqueue a prompt. Preempts the current run if one is active. */
   async enqueue(prompt: string): Promise<void> {
@@ -46,104 +39,89 @@ export class Channel {
   }
 
   async stop(): Promise<void> {
-    if (this.currentRun) {
-      await this.currentRun.stop();
-    }
+    if (this.currentRun) await this.currentRun.stop();
   }
 
   private async runPrompt(prompt: string): Promise<void> {
     this.processing = true;
     this.pendingPrompt = null;
 
-    const { chatId, adapter, card } = this;
+    const { chatId, adapter, lark } = this;
     const cwd = getSessionCwd(chatId);
     const existing = getSession(chatId);
     const sessionId = existing?.agentId || undefined;
 
-    const state: RunCardState = {
-      messageId: '',
-      status: 'running',
-      text: '',
-      tools: [],
-      inputTokens: 0,
-      outputTokens: 0,
-    };
-
-    // Post initial card.
-    state.messageId = await card.createRunCard(chatId, cwd);
-
-    // Throttled card updater.
-    let lastPatch = 0;
-    const patch = async (final = false) => {
-      const now = Date.now();
-      if (!final && now - lastPatch < CARD_PATCH_INTERVAL_MS) return;
-      lastPatch = now;
-      await card.patchRunCard(state.messageId, state, cwd);
-    };
-
     const run = adapter.run({ prompt, cwd, sessionId });
     this.currentRun = run;
 
-    try {
+    const composer = new TranscriptComposer();
+    let fullText = '';        // mirror, for the no-streaming fallback path
+    let nextSessionId: string | undefined;
+    let sawError = false;
+
+    const consume = async (emit: (chunk: string) => Promise<void>) => {
       for await (const event of run.events) {
         switch (event.type) {
-          case 'text':
-            state.text += event.delta;
-            log.info('channel', 'text-delta', { chatId, len: state.text.length });
-            await patch();
-            break;
-
           case 'thinking':
-            // Optionally show thinking in a collapsed section.
+            await emit(composer.thinking(event.delta));
             break;
-
+          case 'text':
+            await emit(composer.answer(event.delta));
+            break;
           case 'tool_use':
-            state.tools.push(`${event.name}(${JSON.stringify(event.input).slice(0, 80)})`);
-            await patch();
+            await emit(composer.toolUse(event.name, event.input));
             break;
-
           case 'tool_result':
-            // Optionally append result preview.
+            await emit(composer.toolResult(event.output, event.isError));
             break;
-
           case 'usage':
-            state.inputTokens += event.inputTokens ?? 0;
-            state.outputTokens += event.outputTokens ?? 0;
             break;
-
-          case 'done': {
-            state.status = 'done';
-            // Persist the new agentId for session resumption.
-            if (event.nextSessionId) {
-              if (existing) {
-                updateAgentId(chatId, event.nextSessionId);
-              } else {
-                setSession(chatId, { agentId: event.nextSessionId, cwd, updatedAt: Date.now() });
-              }
-            }
-            await patch(true);
+          case 'done':
+            nextSessionId = event.nextSessionId;
             break;
-          }
-
           case 'error':
-            log.error('channel', 'run-error', { chatId, message: event.message });
-            state.status = 'error';
-            state.text += `\n\n❌ ${event.message}`;
-            await patch(true);
+            sawError = true;
+            await emit(composer.error(event.message));
             break;
         }
       }
+    };
+
+    try {
+      await lark.stream(chatId, {
+        markdown: async (controller) => {
+          await consume(async (chunk) => {
+            if (!chunk) return;
+            fullText += chunk;
+            await controller.append(chunk);
+          });
+        },
+      });
     } catch (err) {
-      log.error('channel', 'unexpected', { chatId, err: String(err) });
-      state.status = 'error';
-      state.text += `\n\n❌ 内部错误: ${String(err)}`;
-      await patch(true);
+      // Streaming path failed (e.g. missing cardkit permission, or it threw
+      // before consuming any events). Degrade gracefully: drain whatever is
+      // left and post the transcript as a single markdown message.
+      log.warn('channel', 'stream-failed', { chatId, err: String(err) });
+      try {
+        if (!fullText) {
+          await consume(async (chunk) => { fullText += chunk; });
+        }
+        const body = fullText.trim() || '（无输出）';
+        await lark.send(chatId, { markdown: body });
+      } catch (fallbackErr) {
+        log.error('channel', 'fallback-failed', { chatId, err: String(fallbackErr) });
+      }
     } finally {
       this.currentRun = null;
       this.processing = false;
     }
 
-    // If a new message arrived while we were running, process it now.
+    if (nextSessionId) {
+      if (existing) updateAgentId(chatId, nextSessionId);
+      else setSession(chatId, { agentId: nextSessionId, cwd, updatedAt: Date.now() });
+    }
+    log.info('channel', 'run-complete', { chatId, error: sawError, textLen: fullText.length });
+
     if (this.pendingPrompt) {
       const next = this.pendingPrompt;
       this.pendingPrompt = null;

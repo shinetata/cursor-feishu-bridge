@@ -32,15 +32,16 @@ export class BotHandler {
         log.error('handler', 'message-error', { err: String(err) })
       ),
 
-      // Card action: "⏹ Stop" button or custom __cursor_cb callbacks.
+      // Card action: "⏹ Stop" button or custom callbacks.
       cardAction: (evt) => {
         const chatId = evt.chatId;
-        const action = (evt.value as Record<string, unknown>)?.action;
+        const value = evt.action?.value as Record<string, unknown> | undefined;
+        const action = value?.action;
         if (action === 'stop') {
           const ch = this.channels.get(chatId);
           if (ch) void ch.stop();
         }
-        log.info('handler', 'card-action', { chatId, action });
+        log.info('handler', 'card-action', { chatId, action: String(action) });
       },
 
       reject: (evt) => {
@@ -52,7 +53,7 @@ export class BotHandler {
   private getChannel(chatId: string): Channel {
     let ch = this.channels.get(chatId);
     if (!ch) {
-      ch = new Channel(chatId, this.adapter, this.card);
+      ch = new Channel(chatId, this.adapter, this.larkChannel);
       this.channels.set(chatId, ch);
     }
     return ch;

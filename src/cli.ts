@@ -208,6 +208,12 @@ async function startBridge(): Promise<void> {
     appSecret: cfg.feishu.appSecret,
     domain: cfg.feishu.tenant === 'lark' ? Domain.Lark : Domain.Feishu,
     loggerLevel: LoggerLevel.warn,
+    // Streaming card tuning: native typewriter via cardkit.cardElement.content.
+    outbound: {
+      streamInitialText: '🧠 思考中…',
+      streamThrottleMs: 120,
+      streamThrottleChars: 40,
+    },
     policy: {
       dmMode: 'open',
       requireMention: cfg.preferences?.requireMentionInGroup ?? true,
